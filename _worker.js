@@ -5,13 +5,16 @@ let rootDomain = "";
 let serviceName = "";
 let APP_DOMAIN = "";
 
-const apiKey = ""; // Ganti dengan Global API key kalian (https://dash.cloudflare.com/profile/api-tokens)
-const apiEmail = ""; // Ganti dengan email yang kalian gunakan
-const accountID = ""; // Ganti dengan Account ID kalian (https://dash.cloudflare.com -> Klik domain yang kalian gunakan)
-const zoneID = ""; // Ganti dengan Zone ID kalian (https://dash.cloudflare.com -> Klik domain yang kalian gunakan)
+const apiKey = env.API_KEY || ""; // Ganti dengan Global API key kalian (https://dash.cloudflare.com/profile/api-tokens)
+const apiEmail = env.API_EMAIL || ""; // Ganti dengan email yang kalian gunakan
+const accountID = env.ACCOUNT_ID || ""; // Ganti dengan Account ID kalian (https://dash.cloudflare.com -> Klik domain yang kalian gunakan)
+const zoneID = env.ZONE_ID || ""; // Ganti dengan Zone ID kalian (https://dash.cloudflare.com -> Klik domain yang kalian gunakan)
 let isApiReady = false;
 let prxIP = "";
 let cachedPrxList = [];
+
+const relayUDPHost = env.RELAY_UDP_HOST || "udp-relay.hobihaus.space"; // Kontribusi atau cek relay publik disini: https://hub.docker.com/r/kelvinzer0/udp-relay
+const relayUDPPort = env.RELAY_UDP_PORT || 7300;
 
 // Constant
 const horse = "dHJvamFu";
@@ -21,15 +24,15 @@ const neko = "Y2xhc2g=";
 
 const PORTS = [443, 80];
 const PROTOCOLS = [atob(horse), atob(flash), "ss"];
-const SUB_PAGE_URL = "https://foolvpn.me/nautica";
-const KV_PRX_URL = "https://raw.githubusercontent.com/FoolVPN-ID/Nautica/refs/heads/main/kvProxyList.json";
-const PRX_BANK_URL = "https://raw.githubusercontent.com/FoolVPN-ID/Nautica/refs/heads/main/proxyList.txt";
-const DNS_SERVER_ADDRESS = "8.8.8.8";
-const DNS_SERVER_PORT = 53;
-const PRX_HEALTH_CHECK_API = "https://id1.foolvpn.me/api/v1/check";
-const CONVERTER_URL = "https://api.foolvpn.me/convert";
+const SUB_PAGE_URL = env.SUB_PAGE_URL || "https://foolvpn.me/nautica";
+const KV_PRX_URL = env.KV_PRX_URL || "https://raw.githubusercontent.com/FoolVPN-ID/Nautica/refs/heads/main/kvProxyList.json";
+const PRX_BANK_URL = env.PRX_BANK_URL || "https://raw.githubusercontent.com/FoolVPN-ID/Nautica/refs/heads/main/proxyList.txt";
+const DNS_SERVER_ADDRESS = env.DNS_SERVER_ADDRESS || "8.8.8.8";
+const DNS_SERVER_PORT = env.DNS_SERVER_PORT || 53;
+const PRX_HEALTH_CHECK_API = env.PRX_HEALTH_CHECK_API || "https://id1.foolvpn.me/api/v1/check";
+const CONVERTER_URL = env.CONVERTER_URL || "https://api.foolvpn.me/convert";
 const BAD_WORDS_LIST =
-  "https://gist.githubusercontent.com/adierebel/a69396d79b787b84d89b45002cb37cd6/raw/6df5f8728b18699496ad588b3953931078ab9cf1/kata-kasar.txt";
+  env.BAD_WORDS_LIST || "https://gist.githubusercontent.com/adierebel/a69396d79b787b84d89b45002cb37cd6/raw/6df5f8728b18699496ad588b3953931078ab9cf1/kata-kasar.txt";
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
 const CORS_HEADER_OPTIONS = {
@@ -485,6 +488,62 @@ async function handleTCPOutBound(
 async function handleUDPOutbound(targetAddress, targetPort, udpChunk, webSocket, responseHeader, log) {
   try {
     let protocolHeader = responseHeader;
+    
+    const tcpSocket = connect({
+      hostname: relayUDPHost,
+      port: relayUDPPort,
+    });
+
+    log(`Connected to relay server at ${relayUDPHost}:${relayUDPPort}`);
+
+    // Prepare the header and payload for relay protocol
+    const header = `${targetAddress}:${targetPort}`;
+    const headerBuffer = new TextEncoder().encode(header);
+    const separator = new Uint8Array([0x7C]); // '|' character
+    
+    // Combine header + separator + UDP data
+    const relayMessage = new Uint8Array(headerBuffer.length + separator.length + udpChunk.byteLength);
+    relayMessage.set(headerBuffer, 0);
+    relayMessage.set(separator, headerBuffer.length);
+    relayMessage.set(new Uint8Array(udpChunk), headerBuffer.length + separator.length);
+
+    const writer = tcpSocket.writable.getWriter();
+    await writer.write(relayMessage);
+    writer.releaseLock();
+
+    log(`Sent UDP data to target ${targetAddress}:${targetPort} via relay`);
+
+    // Handle response from relay server
+    await tcpSocket.readable.pipeTo(
+      new WritableStream({
+        async write(chunk) {
+          if (webSocket.readyState === WS_READY_STATE_OPEN) {
+            if (protocolHeader) {
+              webSocket.send(await new Blob([protocolHeader, chunk]).arrayBuffer());
+              protocolHeader = null;
+            } else {
+              webSocket.send(chunk);
+            }
+          }
+        },
+        close() {
+          log(`Relay connection to ${targetAddress} closed`);
+        },
+        abort(reason) {
+          console.error(`Relay connection aborted due to ${reason}`);
+        },
+      })
+    );
+  } catch (e) {
+    console.error(`Error while handling UDP outbound via relay: ${e.message}`);
+    // Fallback to direct TCP if relay fails
+    await handleTCPOutbound(targetAddress, targetPort, udpChunk, webSocket, responseHeader, log);
+  }
+}
+
+async function handleTCPOutbound(targetAddress, targetPort, udpChunk, webSocket, responseHeader, log) {
+  try {
+    let protocolHeader = responseHeader;
     const tcpSocket = connect({
       hostname: targetAddress,
       port: targetPort,
@@ -509,15 +568,15 @@ async function handleUDPOutbound(targetAddress, targetPort, udpChunk, webSocket,
           }
         },
         close() {
-          log(`UDP connection to ${targetAddress} closed`);
+          log(`TCP connection to ${targetAddress} closed`);
         },
         abort(reason) {
-          console.error(`UDP connection to ${targetPort} aborted due to ${reason}`);
+          console.error(`TCP connection to ${targetPort} aborted due to ${reason}`);
         },
       })
     );
   } catch (e) {
-    console.error(`Error while handling UDP outbound, error ${e.message}`);
+    console.error(`Error while handling TCP outbound, error ${e.message}`);
   }
 }
 
