@@ -420,30 +420,71 @@ async function handleTCPOutBound(
   remoteSocket,
   addressRemote,
   portRemote,
-  rawClientData,
+  dataChuck,
   webSocket,
   responseHeader,
-  log
+  log,
+  relayUDP,
+  protocol
 ) {
   async function connectAndWrite(address, port) {
-    const tcpSocket = connect({
-      hostname: address,
-      port: port,
-    });
+    let tcpSocket;
+    let tmpChuck;
+    if (PORTS.includes(parseInt(prxIP.split(/[:=-]/)[1] || portRemote))) {
+      tcpSocket = connect({
+        hostname: address,
+        port: port,
+      });
+      tmpChuck = dataChuck
+    } else {
+      tcpSocket = connect({
+        hostname: relayUDP.host,
+        port: relayUDP.port,
+      });
+      const header = `${protocol}:${targetAddress}:${targetPort}`;
+      const headerBuffer = new TextEncoder().encode(header);
+      const separator = new Uint8Array([0x7C]);
+      const relayMessage = new Uint8Array(headerBuffer.length + separator.length + dataChunk.byteLength);
+      relayMessage.set(headerBuffer, 0);
+      relayMessage.set(separator, headerBuffer.length);
+      relayMessage.set(new Uint8Array(dataChunk), headerBuffer.length + separator.length);
+      tmpChuck = relayMessage;
+    }
+
     remoteSocket.value = tcpSocket;
     log(`connected to ${address}:${port}`);
     const writer = tcpSocket.writable.getWriter();
-    await writer.write(rawClientData);
+    await writer.write(tmpChuck);
     writer.releaseLock();
+
 
     return tcpSocket;
   }
 
   async function retry() {
-    const tcpSocket = await connectAndWrite(
-      prxIP.split(/[:=-]/)[0] || addressRemote,
-      prxIP.split(/[:=-]/)[1] || portRemote
-    );
+    let tcpSocket;
+    let tmpChuck;
+    if (PORTS.includes(parseInt(prxIP.split(/[:=-]/)[1] || portRemote))) {
+      tcpSocket = await connectAndWrite(
+        prxIP.split(/[:=-]/)[0] || addressRemote,
+        prxIP.split(/[:=-]/)[1] || portRemote
+      );
+      tmpChuck = dataChuck;
+    } else {
+      tcpSocket = await connectAndWrite(
+        relayUDP.host,
+        relayUDP.port
+      );
+      const header = `${protocol}:${targetAddress}:${targetPort}`;
+      const headerBuffer = new TextEncoder().encode(header);
+      const separator = new Uint8Array([0x7C]);
+      const relayMessage = new Uint8Array(headerBuffer.length + separator.length + dataChunk.byteLength);
+      relayMessage.set(headerBuffer, 0);
+      relayMessage.set(separator, headerBuffer.length);
+      relayMessage.set(new Uint8Array(dataChunk), headerBuffer.length + separator.length);
+      tmpChuck = relayMessage;
+    }
+
     tcpSocket.closed
       .catch((error) => {
         console.log("retry tcpSocket closed error", error);
@@ -459,33 +500,35 @@ async function handleTCPOutBound(
   remoteSocketToWS(tcpSocket, webSocket, responseHeader, retry, log);
 }
 
-async function handleUDPOutbound(targetAddress, targetPort, udpChunk, webSocket, responseHeader, log, relayUDP) {
+async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, responseHeader, log, relay, protocol) {
   try {
     let protocolHeader = responseHeader;
-
-    const tcpSocket = connect({
-      hostname: relayUDP.host,
-      port: relayUDP.port,
-    });
-
-    log(`Connected to relay server at ${relayUDP.host}:${relayUDP.port}`);
-
-    // Prepare the header and payload for relay protocol
-    const header = `${targetAddress}:${targetPort}`;
-    const headerBuffer = new TextEncoder().encode(header);
-    const separator = new Uint8Array([0x7C]); // '|' character
-
-    // Combine header + separator + UDP data
-    const relayMessage = new Uint8Array(headerBuffer.length + separator.length + udpChunk.byteLength);
-    relayMessage.set(headerBuffer, 0);
-    relayMessage.set(separator, headerBuffer.length);
-    relayMessage.set(new Uint8Array(udpChunk), headerBuffer.length + separator.length);
+    let tcpSocket;
+    let tmpChuck;
+    if (PORTS.includes(parseInt(targetPort))) {
+      tcpSocket = connect({
+        hostname: targetAddress,
+        port: targetPort,
+      });
+      tmpChuck = dataChuck;
+    } else {
+      tcpSocket = connect({
+        hostname: relay.host,
+        port: relay.port,
+      });
+      const header = `${protocol}:${targetAddress}:${targetPort}`;
+      const headerBuffer = new TextEncoder().encode(header);
+      const separator = new Uint8Array([0x7C]);
+      const relayMessage = new Uint8Array(headerBuffer.length + separator.length + dataChunk.byteLength);
+      relayMessage.set(headerBuffer, 0);
+      relayMessage.set(separator, headerBuffer.length);
+      relayMessage.set(new Uint8Array(dataChunk), headerBuffer.length + separator.length);
+      tmpChuck = relayMessage;
+    }
 
     const writer = tcpSocket.writable.getWriter();
-    await writer.write(relayMessage);
+    await writer.write(tmpChuck);
     writer.releaseLock();
-
-    log(`Sent UDP data to target ${targetAddress}:${targetPort} via relay`);
 
     // Handle response from relay server
     await tcpSocket.readable.pipeTo(
@@ -510,47 +553,6 @@ async function handleUDPOutbound(targetAddress, targetPort, udpChunk, webSocket,
     );
   } catch (e) {
     console.error(`Error while handling UDP outbound via relay: ${e.message}`);
-    // Fallback to direct TCP if relay fails
-    await handleTCPOutbound(targetAddress, targetPort, udpChunk, webSocket, responseHeader, log);
-  }
-}
-
-async function handleTCPOutbound(targetAddress, targetPort, udpChunk, webSocket, responseHeader, log) {
-  try {
-    let protocolHeader = responseHeader;
-    const tcpSocket = connect({
-      hostname: targetAddress,
-      port: targetPort,
-    });
-
-    log(`Connected to ${targetAddress}:${targetPort}`);
-
-    const writer = tcpSocket.writable.getWriter();
-    await writer.write(udpChunk);
-    writer.releaseLock();
-
-    await tcpSocket.readable.pipeTo(
-      new WritableStream({
-        async write(chunk) {
-          if (webSocket.readyState === WS_READY_STATE_OPEN) {
-            if (protocolHeader) {
-              webSocket.send(await new Blob([protocolHeader, chunk]).arrayBuffer());
-              protocolHeader = null;
-            } else {
-              webSocket.send(chunk);
-            }
-          }
-        },
-        close() {
-          log(`TCP connection to ${targetAddress} closed`);
-        },
-        abort(reason) {
-          console.error(`TCP connection to ${targetPort} aborted due to ${reason}`);
-        },
-      })
-    );
-  } catch (e) {
-    console.error(`Error while handling TCP outbound, error ${e.message}`);
   }
 }
 
@@ -690,18 +692,12 @@ async function websocketHandler(request, dnsServer, relayUDP) {
 
   const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log);
 
-  let remoteSocketWrapper = {
-    value: null,
-  };
-  let isDNS = false;
+  let remoteSocketWrapper = { value: null };
 
   readableWebSocketStream
     .pipeTo(
       new WritableStream({
-        async write(chunk, controller) {
-          if (isDNS) {
-            return handleUDPOutbound(dnsServer.address, dnsServer.port, chunk, webSocket, null, log, relayUDP);
-          }
+        async write(chunk) {
           if (remoteSocketWrapper.value) {
             const writer = remoteSocketWrapper.value.writable.getWriter();
             await writer.write(chunk);
@@ -729,15 +725,8 @@ async function websocketHandler(request, dnsServer, relayUDP) {
             throw new Error(protocolHeader.message);
           }
 
-          if (protocolHeader.isUDP) {
-            if (protocolHeader.portRemote === 53) {
-              isDNS = true;
-            } else {
-              throw new Error("TCP only support for DNS port 53");
-            }
-          }
-
-          if (isDNS) {
+          // === Logic DNS / relay check ===
+          if ((!relayUDP.host && !relayUDP.port) || protocolHeader.portRemote === 53) {
             return handleUDPOutbound(
               dnsServer.address,
               dnsServer.port,
@@ -745,18 +734,22 @@ async function websocketHandler(request, dnsServer, relayUDP) {
               webSocket,
               protocolHeader.version,
               log,
-              relayUDP
+              relayUDP,
+              'udp'
             );
           }
 
-          handleTCPOutBound(
+          // Default: TCP outbound
+          return handleTCPOutBound(
             remoteSocketWrapper,
             protocolHeader.addressRemote,
             protocolHeader.portRemote,
             protocolHeader.rawClientData,
             webSocket,
             protocolHeader.version,
-            log
+            log,
+            relayUDP,
+            'tcp'
           );
         },
         close() {
@@ -771,10 +764,7 @@ async function websocketHandler(request, dnsServer, relayUDP) {
       log("readableWebSocketStream pipeTo error", err);
     });
 
-  return new Response(null, {
-    status: 101,
-    webSocket: client,
-  });
+  return new Response(null, { status: 101, webSocket: client });
 }
 
 // Main export
@@ -795,7 +785,7 @@ export default {
       address: env.DNS_SERVER_ADDRESS || "8.8.8.8",
       port: env.DNS_SERVER_PORT || 53
     }
-   
+
     const PRX_HEALTH_CHECK_API = env.PRX_HEALTH_CHECK_API || "https://id1.foolvpn.me/api/v1/check";
     const CONVERTER_URL = env.CONVERTER_URL || "https://api.foolvpn.me/convert";
     const BAD_WORDS_LIST =
