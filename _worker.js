@@ -416,45 +416,35 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
   return stream;
 }
 
-async function handleTCPOutBound(
-  remoteSocket,
-  addressRemote,
-  portRemote,
-  dataChuck,
-  webSocket,
-  responseHeader,
-  log,
-  relayUDP,
-  protocol
-) {
+async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, dataChunk, webSocket, responseHeader, log, relay, protocol) {
   async function connectAndWrite(address, port) {
     let tcpSocket;
-    let tmpChuck;
-    if (PORTS.includes(parseInt(prxIP.split(/[:=-]/)[1] || portRemote))) {
+    let tmpChunk;
+    if (PORTS.includes(parseInt(prxIP.split(/[:=-]/)[1] || port))) {
       tcpSocket = connect({
         hostname: address,
         port: port,
       });
-      tmpChuck = dataChuck
+      tmpChunk = dataChunk
     } else {
       tcpSocket = connect({
-        hostname: relayUDP.host,
-        port: relayUDP.port,
+        hostname: relay.host,
+        port: relay.port,
       });
-      const header = `${protocol}:${targetAddress}:${targetPort}`;
+      const header = `${protocol}:${address}:${port}`;
       const headerBuffer = new TextEncoder().encode(header);
       const separator = new Uint8Array([0x7C]);
       const relayMessage = new Uint8Array(headerBuffer.length + separator.length + dataChunk.byteLength);
       relayMessage.set(headerBuffer, 0);
       relayMessage.set(separator, headerBuffer.length);
       relayMessage.set(new Uint8Array(dataChunk), headerBuffer.length + separator.length);
-      tmpChuck = relayMessage;
+      tmpChunk = relayMessage;
     }
 
     remoteSocket.value = tcpSocket;
     log(`connected to ${address}:${port}`);
     const writer = tcpSocket.writable.getWriter();
-    await writer.write(tmpChuck);
+    await writer.write(tmpChunk);
     writer.releaseLock();
 
 
@@ -463,26 +453,26 @@ async function handleTCPOutBound(
 
   async function retry() {
     let tcpSocket;
-    let tmpChuck;
+    let tmpChunk;
     if (PORTS.includes(parseInt(prxIP.split(/[:=-]/)[1] || portRemote))) {
       tcpSocket = await connectAndWrite(
         prxIP.split(/[:=-]/)[0] || addressRemote,
         prxIP.split(/[:=-]/)[1] || portRemote
       );
-      tmpChuck = dataChuck;
+      tmpChunk = dataChunk;
     } else {
       tcpSocket = await connectAndWrite(
-        relayUDP.host,
-        relayUDP.port
+        relay.host,
+        relay.port
       );
-      const header = `${protocol}:${targetAddress}:${targetPort}`;
+      const header = `${protocol}:${addressRemote}:${portRemote}`;
       const headerBuffer = new TextEncoder().encode(header);
       const separator = new Uint8Array([0x7C]);
       const relayMessage = new Uint8Array(headerBuffer.length + separator.length + dataChunk.byteLength);
       relayMessage.set(headerBuffer, 0);
       relayMessage.set(separator, headerBuffer.length);
       relayMessage.set(new Uint8Array(dataChunk), headerBuffer.length + separator.length);
-      tmpChuck = relayMessage;
+      tmpChunk = relayMessage;
     }
 
     tcpSocket.closed
@@ -504,13 +494,13 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
   try {
     let protocolHeader = responseHeader;
     let tcpSocket;
-    let tmpChuck;
+    let tmpChunk;
     if (PORTS.includes(parseInt(targetPort))) {
       tcpSocket = connect({
         hostname: targetAddress,
         port: targetPort,
       });
-      tmpChuck = dataChuck;
+      tmpChunk = dataChunk;
     } else {
       tcpSocket = connect({
         hostname: relay.host,
@@ -523,14 +513,13 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
       relayMessage.set(headerBuffer, 0);
       relayMessage.set(separator, headerBuffer.length);
       relayMessage.set(new Uint8Array(dataChunk), headerBuffer.length + separator.length);
-      tmpChuck = relayMessage;
+      tmpChunk = relayMessage;
     }
 
     const writer = tcpSocket.writable.getWriter();
-    await writer.write(tmpChuck);
+    await writer.write(tmpChunk);
     writer.releaseLock();
 
-    // Handle response from relay server
     await tcpSocket.readable.pipeTo(
       new WritableStream({
         async write(chunk) {
@@ -677,7 +666,7 @@ class CloudflareApi {
 }
 
 // Main websocket handler
-async function websocketHandler(request, dnsServer, relayUDP) {
+async function websocketHandler(request, dnsServer, relay) {
   const webSocketPair = new WebSocketPair();
   const [client, webSocket] = Object.values(webSocketPair);
 
@@ -725,8 +714,18 @@ async function websocketHandler(request, dnsServer, relayUDP) {
             throw new Error(protocolHeader.message);
           }
 
-          // === Logic DNS / relay check ===
-          if ((!relayUDP.host && !relayUDP.port) || protocolHeader.portRemote === 53) {
+          if (!relay.host && !relay.port && protocolHeader.isUDP) {
+            return handleUDPOutbound(
+              protocolHeader.addressRemote,
+              protocolHeader.portRemote,
+              protocolHeader.rawClientData,
+              webSocket,
+              protocolHeader.version,
+              log,
+              relay,
+              'udp'
+            );
+          } else if (protocolHeader.portRemote === 53) {
             return handleUDPOutbound(
               dnsServer.address,
               dnsServer.port,
@@ -734,7 +733,7 @@ async function websocketHandler(request, dnsServer, relayUDP) {
               webSocket,
               protocolHeader.version,
               log,
-              relayUDP,
+              relay,
               'udp'
             );
           }
@@ -748,7 +747,7 @@ async function websocketHandler(request, dnsServer, relayUDP) {
             webSocket,
             protocolHeader.version,
             log,
-            relayUDP,
+            relay,
             'tcp'
           );
         },
@@ -774,9 +773,9 @@ export default {
     const apiEmail = env.API_EMAIL || ""; // Ganti dengan email yang kalian gunakan
     const accountID = env.ACCOUNT_ID || ""; // Ganti dengan Account ID kalian (https://dash.cloudflare.com -> Klik domain yang kalian gunakan)
     const zoneID = env.ZONE_ID || ""; // Ganti dengan Zone ID kalian (https://dash.cloudflare.com -> Klik domain yang kalian gunakan)
-    const RELAY_UDP = {
-      host: env.RELAY_UDP_HOST || "udp-relay.hobihaus.space", // Kontribusi atau cek relay publik disini: https://hub.docker.com/r/kelvinzer0/udp-relay
-      port: env.RELAY_UDP_PORT || 7300
+    const RELAY = {
+      host: env.RELAY_HOST || "udp-relay.hobihaus.space", // Kontribusi atau cek relay publik disini: https://hub.docker.com/r/kelvinzer0/udp-relay
+      port: env.RELAY_PORT || 7300
     }
     const SUB_PAGE_URL = env.SUB_PAGE_URL || "https://foolvpn.me/nautica";
     const KV_PRX_URL = env.KV_PRX_URL || "https://raw.githubusercontent.com/FoolVPN-ID/Nautica/refs/heads/main/kvProxyList.json";
@@ -794,8 +793,9 @@ export default {
     try {
       const url = new URL(request.url);
       APP_DOMAIN = url.hostname;
-      serviceName = APP_DOMAIN.split(".")[0];
-      rootDomain = APP_DOMAIN.replace(`${serviceName}.`, "");
+      const domainParts = APP_DOMAIN.split(".");
+      serviceName = domainParts[0];
+      rootDomain = domainParts.slice(1).join(".");
 
       const upgradeHeader = request.headers.get("Upgrade");
 
@@ -816,10 +816,10 @@ export default {
 
           prxIP = kvPrx[prxKey][Math.floor(Math.random() * kvPrx[prxKey].length)];
 
-          return await websocketHandler(request, DNS_SERVER, RELAY_UDP);
+          return await websocketHandler(request, DNS_SERVER, RELAY);
         } else if (prxMatch) {
           prxIP = prxMatch[1];
-          return await websocketHandler(request, DNS_SERVER, RELAY_UDP);
+          return await websocketHandler(request, DNS_SERVER, RELAY);
         }
       }
 
